@@ -1,0 +1,53 @@
+name: fetch-openelectricity
+
+# 触发方式：手动点按钮 + 每周一自动跑一次
+on:
+  workflow_dispatch:        # Actions 页面手动触发
+  schedule:
+    - cron: "0 18 * * 1"    # 每周一 UTC 18:00（澳东早上）
+
+permissions:
+  contents: write           # 允许把抓到的 CSV 提交回仓库
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          OPENELECTRICITY_API_KEY: ${{ secrets.OPENELECTRICITY_API_KEY }}
+          OE_NETWORK: NEM
+          OE_INTERVAL: 1d
+        run: python fetch.py
+
+      # 方式 A：把 CSV 直接提交回仓库
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "data: refresh $(date -u +%Y-%m-%d)"
+          git push
+
+      # 方式 B（可选）：作为 artifact 上传，不写回仓库
+      # - name: Upload artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: openelectricity-csv
+      #     path: data/*.csv
+
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
