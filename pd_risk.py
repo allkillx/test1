@@ -319,6 +319,45 @@ def scenario_defs(tables):
     return pd.DataFrame()
 
 
+def analyse_local_prices(tables, df, reg=FOCUS):
+    """Per-unit local price adjustments from PD LOCAL_PRICE: which DUIDs are held back
+    (or pushed on) by binding network constraints, and when. Local price ≈ RRP − adjustment
+    sign conventions vary by table version, so both the raw adjustment and the regional
+    price are reported."""
+    lp = no_intervention(pick(tables, "LOCAL_PRICE"))
+    if lp.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    print("LOCAL_PRICE columns:", list(lp.columns))
+    adj_col = next((c for c in lp.columns if "ADJUSTMENT" in c), None)
+    flag_col = next((c for c in lp.columns if "CONSTRAINED" in c), None)
+    if adj_col is None or "DUID" not in lp.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    lp = lp[lp[adj_col].fillna(0) != 0].copy()
+    if lp.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    rrp = df[df["REGIONID"] == reg].set_index("DATETIME")["RRP"]
+    lp["RRP"] = lp["DATETIME"].map(rrp)
+    rows = []
+    for duid, g in lp.groupby("DUID"):
+        cap = g[g["RRP"] >= P_EXTREME]
+        rows.append({
+            "duid": duid,
+            "periods_adjusted": len(g),
+            "windows": windows(g["DATETIME"]),
+            "adj_min": round(float(g[adj_col].min()), 0),
+            "adj_max": round(float(g[adj_col].max()), 0),
+            "cap_periods_adjusted": len(cap),
+            "adj_in_cap_periods": "" if cap.empty else
+                f"{cap[adj_col].min():,.0f} .. {cap[adj_col].max():,.0f}",
+            "locally_constrained_periods": int((g[flag_col] > 0).sum()) if flag_col else "",
+        })
+    summ = pd.DataFrame(rows)
+    summ["_k"] = summ[["adj_min", "adj_max"]].abs().max(axis=1)
+    summ = summ.sort_values(["cap_periods_adjusted", "_k"], ascending=False).drop(columns="_k")
+    detail = lp.rename(columns={adj_col: "ADJ"})[["DUID", "DATETIME", "ADJ", "RRP"]]
+    return summ, detail
+
+
 def analyse_pdpasa(tables):
     rs = pick(tables, "REGIONSOLUTION")
     if rs.empty:
@@ -712,6 +751,7 @@ def main():
 
     piv = df.pivot_table(index="DATETIME", columns="REGIONID", values="RRP").round(0)
     fp = focus_periods(df, ic, pasa, pd_tables)
+    lp_summ, lp_detail = analyse_local_prices(pd_tables, df)
     pinned = con_summ[con_summ["pinned"]] if not con_summ.empty else con_summ
     con_summ = con_summ[~con_summ["pinned"]].drop(columns="pinned") if not con_summ.empty else con_summ
     focus_cons = (con_summ[con_summ["constraint"].map(relevant_constraint)]
@@ -796,6 +836,14 @@ def main():
           (", ".join(f"`{r.constraint}` ({r.windows})" for r in pinned.itertuples())
            if not pinned.empty else "none."),
           "",
+          "## 6b. Units affected by binding constraints (PD LOCAL_PRICE)",
+          "Units whose local price differs from the regional price because a binding network "
+          "constraint has them on its left-hand side. A large adjustment during cap periods means "
+          "the unit is being held back (or pushed on) by the network while the regional price is "
+          f"high. Sorted by number of {FOCUS} cap periods affected.",
+          "",
+          fmt_table(lp_summ.head(40)) if not lp_summ.empty else "No local price adjustments in this run.",
+          "",
           "## 7. PD PASA lack-of-reserve forecast",
           fmt_table(pasa[pasa["LORCONDITION"] > 0]) if (not pasa.empty and "LORCONDITION" in pasa
                                                         and (pasa["LORCONDITION"] > 0).any())
@@ -830,6 +878,10 @@ def main():
         "focus": FOCUS,
         "focus_periods": json.loads(fp.assign(period_ending=fp["period_ending"].dt.strftime(
             "%Y-%m-%d %H:%M")).to_json(orient="records")),
+        "local_price_units": json.loads(lp_summ.head(60).to_json(orient="records"))
+        if not lp_summ.empty else [],
+        "local_price_detail": json.loads(lp_detail.assign(DATETIME=lambda x: x["DATETIME"].dt.strftime(
+            "%Y-%m-%d %H:%M")).to_json(orient="records")) if not lp_detail.empty else [],
         "focus_constraints": json.loads(focus_cons.head(20).to_json(orient="records"))
         if not focus_cons.empty else [],
         "regions": {reg: {
