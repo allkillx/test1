@@ -1,0 +1,22 @@
+name: nem-live
+
+# NEM live status (NOS outages + PD constraints + map data) for the live map page.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/aemo-pd-risk-forecast-zocdpm]
+    paths: [tools/discover.py, nem_live.py, .github/workflows/nem-live.yml]
+
+jobs:
+  nem-live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas requests
+      - name: Discover data sources
+        env:
+          OPENELECTRICITY_API_KEY: ${{ secrets.OPENELECTRICITY_API_KEY }}
+        run: python tools/discover.py

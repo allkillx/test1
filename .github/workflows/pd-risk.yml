@@ -1,0 +1,27 @@
+name: aemo-pd-risk
+
+# AEMO PD 风险预测：推送到本分支、手动触发、或每天 NEM 早上 6:30 / 下午 2:30 自动跑
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/aemo-pd-risk-forecast-zocdpm]
+    paths: [pd_risk.py, .github/workflows/pd-risk.yml]
+  schedule:
+    - cron: "30 20 * * *"   # UTC 20:30 = NEM 06:30
+    - cron: "30 4 * * *"    # UTC 04:30 = NEM 14:30
+
+jobs:
+  pd-risk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas requests matplotlib
+      - name: Run PD risk forecast
+        run: python pd_risk.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pd-risk-report
+          path: reports/
