@@ -126,10 +126,14 @@ def analyse_pd(tables):
     if keep:
         df = df.merge(sol[["REGIONID", "DATETIME"] + keep], on=["REGIONID", "DATETIME"], how="left")
     if not sens.empty:
-        sc = [c for c in sens.columns if re.fullmatch(r"RRPEEP\d+", c)]
+        # 场景列：老格式 RRPEEP1..43，新格式可能是 RRPSCENARIO1.. 等，统一按 "RRP*数字" 识别
+        sc = [c for c in sens.columns if re.fullmatch(r"RRP[A-Z_]*\d+", c)]
+        print(f"PRICESENSITIVITIES: {len(sens)} 行, 场景列 {len(sc)} 个: {sc[:3]}...")
         s = sens[["REGIONID", "DATETIME"]].copy()
         s["SENS_MAX"] = sens[sc].max(axis=1)
         s["SENS_MIN"] = sens[sc].min(axis=1)
+        s["SENS_MAX_SCEN"] = sens[sc].idxmax(axis=1).str.extract(r"(\d+)$", expand=False)
+        s["SENS_N_GE_1000"] = (sens[sc] >= P_SPIKE).sum(axis=1)
         df = df.merge(s, on=["REGIONID", "DATETIME"], how="left")
     if {"AVAILABLEGENERATION", "DISPATCHABLEGENERATION"} <= set(df.columns):
         df["SPARE_MW"] = df["AVAILABLEGENERATION"] - df["DISPATCHABLEGENERATION"]
@@ -148,6 +152,40 @@ def analyse_pd(tables):
                         max_flow=("MWFLOW", "max"), min_flow=("MWFLOW", "min"))
                    .reset_index())
     return df, ic_bind
+
+
+def find_sensitivity_tables(run):
+    """PRICESENSITIVITIES 已不在 PredispatchIS 文件里；到 /Reports/Current/ 下找含
+    "sensitiv" 的目录，取与 PD 同一期（或最新）的文件。"""
+    dirs = [h for h in listing("/Reports/Current/") if re.search(r"sensitiv", h, re.I)]
+    print("Sensitivity 目录:", dirs)
+    for d in dirs:
+        path = d if d.startswith("/") else "/Reports/Current/" + d
+        zips = sorted(h for h in listing(path) if h.lower().endswith(".zip"))
+        if not zips:
+            continue
+        same = [z for z in zips if run in z]
+        href = (same or zips)[-1]
+        print("Sensitivity 文件:", href)
+        t = read_aemo_zip(href)
+        for (grp, tbl), df in t.items():
+            print(f"  表 {grp}.{tbl}: {len(df)} 行, 列 {list(df.columns)[:12]}...")
+        return t
+    return {}
+
+
+def scenario_defs(tables):
+    """场景定义（每个场景对各区域需求的偏移 MW），若文件里有的话。"""
+    for (grp, tbl), df in tables.items():
+        if "SCENARIO" in df.columns and "DELTAMW" in df.columns and "REGIONID" in df.columns:
+            d = df.copy()
+            if "EFFECTIVEDATE" in d.columns:
+                d = d[d["EFFECTIVEDATE"] == d["EFFECTIVEDATE"].max()]
+            if "VERSIONNO" in d.columns:
+                d = d[d["VERSIONNO"] == d["VERSIONNO"].max()]
+            return d.pivot_table(index="SCENARIO", columns="REGIONID", values="DELTAMW",
+                                 aggfunc="first")
+    return pd.DataFrame()
 
 
 def analyse_pdpasa(tables):
@@ -198,8 +236,7 @@ def region_summary(df, pasa):
         lvl = int(g["RRP"].map(price_level).max())
         sens_max = g["SENS_MAX"].max() if "SENS_MAX" in g else float("nan")
         if pd.notna(sens_max) and price_level(sens_max) >= 3:
-            lvl = max(lvl, 1 if lvl == 0 else lvl)  # 敏感度场景有尖峰 → 至少"关注"
-            lvl = max(lvl, price_level(sens_max) - 1)
+            lvl = max(lvl, 1)  # 敏感度场景有尖峰 → 至少"关注"
         spare_min = g["SPARE_PCT"].min() if "SPARE_PCT" in g else float("nan")
         lor = 0
         lor_first = None
@@ -247,6 +284,14 @@ def main():
     run = re.search(r"_(\d{12})_", pd_href).group(1)
     pd_tables = read_aemo_zip(pd_href)
     print("PD 表:", sorted(t for _, t in pd_tables))
+    scen = pd.DataFrame()
+    if pick(pd_tables, "PRICESENSITIVITIES").empty:
+        try:
+            sens_tables = find_sensitivity_tables(run)
+            pd_tables.update(sens_tables)
+            scen = scenario_defs(sens_tables)
+        except Exception as e:
+            print("Sensitivity 失败:", e)
     df, ic_bind = analyse_pd(pd_tables)
 
     try:
@@ -263,9 +308,10 @@ def main():
     # 今天(NEM 日)的逐时段高风险清单
     today = now.date()
     hot = df[(df["RRP"] >= P_HIGH) | (df.get("SENS_MAX", df["RRP"]) >= P_SPIKE)].copy()
-    hot_cols = [c for c in ["REGIONID", "DATETIME", "RRP", "SENS_MAX", "TOTALDEMAND",
+    hot_cols = [c for c in ["REGIONID", "DATETIME", "RRP", "SENS_MIN", "SENS_MAX",
+                            "SENS_MAX_SCEN", "SENS_N_GE_1000", "TOTALDEMAND",
                             "SPARE_MW", "SPARE_PCT"] if c in hot.columns]
-    hot = hot[hot_cols].round(1)
+    hot = hot[hot_cols].round({c: 1 for c in hot_cols if c not in ("REGIONID", "DATETIME")})
 
     # 每区域按小时电价矩阵（今天 + 明天）
     piv = df.pivot_table(index="DATETIME", columns="REGIONID", values="RRP").round(0)
@@ -284,6 +330,15 @@ def main():
           "",
           "## 高价 / 尖峰时段（RRP≥$300 或敏感度最大≥$1000）",
           fmt_table(hot) if not hot.empty else "无",
+          "",
+          "## 价格敏感度（各需求场景下的 RRP 范围）",
+          fmt_table(df.groupby("REGIONID").agg(
+              rrp_max=("RRP", "max"), sens_min=("SENS_MIN", "min"), sens_max=("SENS_MAX", "max"),
+              periods_any_scen_ge_1000=("SENS_N_GE_1000", lambda x: int((x > 0).sum())),
+          ).round(0).reset_index()) if "SENS_MAX" in df.columns else "未找到 PRICESENSITIVITIES 数据",
+          "",
+          "### 场景定义（需求偏移 MW）",
+          fmt_table(scen.reset_index()) if not scen.empty else "文件中无场景定义表",
           "",
           "## 联络线受限时段数",
           fmt_table(ic_bind) if not ic_bind.empty else "无数据",
