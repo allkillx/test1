@@ -36,9 +36,27 @@ NOTICE_DIR = "/Reports/Current/Market_Notice/"
 OUTDIR = "reports"
 NEM_TZ = timezone(timedelta(hours=10))  # NEM time = AEST, no daylight saving
 REGIONS = ["NSW1", "QLD1", "VIC1", "SA1", "TAS1"]
+FOCUS = os.environ.get("PD_FOCUS_REGION", "NSW1")  # region that gets the deep-dive section
+# Interconnectors into the focus region: (interconnector, sign that makes flow = import)
+FOCUS_IMPORTS = {
+    "NSW1": [("NSW1-QLD1", -1, "QLD"), ("N-Q-MNSP1", -1, "QLD (Terranora)"),
+             ("VIC1-NSW1", +1, "VIC"), ("NSW1-SA1", -1, "SA")],
+    "QLD1": [("NSW1-QLD1", +1, "NSW"), ("N-Q-MNSP1", +1, "NSW (Terranora)")],
+    "VIC1": [("VIC1-NSW1", -1, "NSW"), ("V-SA", -1, "SA"), ("V-S-MNSP1", -1, "SA (Murraylink)"),
+             ("T-V-MNSP1", +1, "TAS")],
+    "SA1": [("V-SA", +1, "VIC"), ("V-S-MNSP1", +1, "VIC (Murraylink)"), ("NSW1-SA1", +1, "NSW")],
+    "TAS1": [("T-V-MNSP1", -1, "VIC")],
+}
+REGION_NAMES = {"NSW1": "New South Wales", "QLD1": "Queensland", "VIC1": "Victoria",
+                "SA1": "South Australia", "TAS1": "Tasmania"}
+COLORS = {"NSW1": "#2a78d6", "QLD1": "#eb6834", "VIC1": "#1baf7a", "SA1": "#eda100",
+          "TAS1": "#e87ba4"}
 
 # Price thresholds ($/MWh)
 P_HIGH, P_SPIKE, P_EXTREME = 300, 1000, 5000
+# Marginal values this large come from constraints that pin a flow/unit to a fixed value
+# (e.g. *_ZERO) and swamp the ranking; they are listed separately.
+MV_PINNED = 1_000_000
 
 # Interconnector ID -> (from, to) for positive flow
 IC_DIRECTION = {
@@ -259,7 +277,8 @@ def analyse_constraints(tables, hot_times):
         })
     summ = (pd.DataFrame(rows)
             .sort_values(["max_abs_marginal_value", "binding_periods"], ascending=False))
-    hot = b[b["DATETIME"].isin(hot_times)]
+    summ["pinned"] = summ["max_abs_marginal_value"] >= MV_PINNED
+    hot = b[b["DATETIME"].isin(hot_times) & (b["ABS_MV"] < MV_PINNED)]
     hot_summ = (hot.groupby("CONSTRAINTID")
                 .agg(periods=("DATETIME", "nunique"), max_abs_mv=("ABS_MV", "max"))
                 .round(0).sort_values("max_abs_mv", ascending=False).head(15).reset_index())
@@ -362,6 +381,94 @@ def is_network_notice(n):
                           r"RECLASSIF|NETWORK|LIMIT", s, re.I))
 
 
+# ---------------------------------------------------------------- focus region
+def focus_periods(df, ic, pasa, tables, reg=FOCUS):
+    """One row per PD period for the focus region: price, scenarios, demand, LOR,
+    imports and whether each import path is at its limit, top binding constraint."""
+    g = df[df["REGIONID"] == reg].copy()
+    out = pd.DataFrame({"period_ending": g["DATETIME"].values})
+    out["pd_rrp"] = g["RRP"].round(0).values
+    if "SENS_MAX" in g:
+        out["scen_>=$1k"] = (g["SENS_N_GE_1000"].fillna(0).astype(int).astype(str)
+                             + "/" + g["SENS_N"].fillna(0).astype(int).astype(str)).values
+        out["scen_max"] = g["SENS_MAX"].round(0).values
+    if "TOTALDEMAND" in g:
+        out["demand"] = g["TOTALDEMAND"].round(0).values
+    if "SPARE_MW" in g:
+        out["spare_mw"] = g["SPARE_MW"].round(0).values
+    if "NETINTERCHANGE" in g:
+        out["net_import"] = (-g["NETINTERCHANGE"]).round(0).values
+    lor = {}
+    if not pasa.empty and "LORCONDITION" in pasa:
+        p = pasa[(pasa["REGIONID"] == reg) & (pasa["LORCONDITION"] > 0)]
+        lor = dict(zip(p["INTERVAL_DATETIME"], p["LORCONDITION"]))
+    out["lor"] = [f"LOR{int(lor[t])}" if t in lor else "" for t in out["period_ending"]]
+    if not ic.empty:
+        for icid, sign, label in FOCUS_IMPORTS.get(reg, []):
+            x = ic[ic["INTERCONNECTORID"] == icid].set_index("DATETIME")
+            if x.empty:
+                continue
+            imp = (sign * x["MWFLOW"]).reindex(out["period_ending"]).round(0)
+            # "at limit" in the import direction for this region
+            at = (x["AT_EXPORT"] if sign > 0 else x["AT_IMPORT"]).reindex(out["period_ending"])
+            out[f"from_{label.split()[0]}"] = [
+                "" if pd.isna(v) else f"{v:.0f}{' ●' if (not pd.isna(a) and bool(a)) else ''}"
+                for v, a in zip(imp.values, at.values)]
+    con = no_intervention(pick(tables, "CONSTRAINT_SOLUTION"))
+    if not con.empty and "MARGINALVALUE" in con.columns:
+        b = con[con["MARGINALVALUE"].fillna(0) != 0].copy()
+        b["ABS_MV"] = b["MARGINALVALUE"].abs()
+        b = b[b["CONSTRAINTID"].astype(str).map(lambda c: relevant_constraint(c, reg))
+              & (b["ABS_MV"] < MV_PINNED)]
+        top = (b.sort_values("ABS_MV", ascending=False).groupby("DATETIME")
+               .agg(top_constraint=("CONSTRAINTID", "first"), mv=("ABS_MV", "first"),
+                    n_binding=("CONSTRAINTID", "nunique")))
+        out = out.merge(top, left_on="period_ending", right_index=True, how="left")
+        out["top_constraint"] = (out["top_constraint"].fillna("") +
+                                 out["mv"].map(lambda v: "" if pd.isna(v) else f" (${v:,.0f})"))
+        out["n_binding"] = out["n_binding"].fillna(0).astype(int)
+        out = out.drop(columns="mv")
+    return out
+
+
+def relevant_constraint(cid, reg=FOCUS):
+    """Constraint touches the focus region: same region letter, or an inter-regional
+    constraint, or one whose leading token names the region letter (heuristic)."""
+    cid = str(cid)
+    head = re.split(r"[-_+]", cid)[0]  # e.g. "N>>N", "V^^N", "I"
+    return cid.startswith("I") or reg[0] in re.sub(r"[^A-Z]", "", head)
+
+
+def focus_headline(fp, reg=FOCUS):
+    lines = []
+    cap = fp[fp["pd_rrp"] >= P_EXTREME]
+    if not cap.empty:
+        lines.append(f"- PD price ≥ $5,000 in **{len(cap)} periods**: {windows(cap['period_ending'])} "
+                     f"(peak ${fp['pd_rrp'].max():,.0f}/MWh).")
+    mid = fp[(fp["pd_rrp"] >= P_HIGH) & (fp["pd_rrp"] < P_EXTREME)]
+    if not mid.empty:
+        lines.append(f"- PD price $300–5,000 in {len(mid)} periods: {windows(mid['period_ending'])}.")
+    if "scen_>=$1k" in fp:
+        n = fp["scen_>=$1k"].str.split("/").str[0].astype(int)
+        tail = fp[(n > 0) & (fp["pd_rrp"] < P_SPIKE)]
+        if not tail.empty:
+            lines.append(f"- Tail risk (base < $1,000 but ≥ $1,000 in some demand scenarios): "
+                         f"{windows(tail['period_ending'])}.")
+    lor = fp[fp["lor"] != ""]
+    if not lor.empty:
+        lines.append(f"- PD PASA forecasts **{lor['lor'].max()}** at {windows(lor['period_ending'])}.")
+    if "demand" in fp:
+        pk = fp.loc[fp["demand"].idxmax()]
+        lines.append(f"- Peak demand {pk['demand']:,.0f} MW at {hhmm(pk['period_ending'])}.")
+    imp_cols = [c for c in fp.columns if c.startswith("from_")]
+    for c in imp_cols:
+        bound = fp[fp[c].str.endswith("●")]
+        if not bound.empty:
+            lines.append(f"- Import from {c[5:]} at its limit in {len(bound)} periods: "
+                         f"{windows(bound['period_ending'])}.")
+    return "\n".join(lines) if lines else "- No elevated risk signals."
+
+
 # ---------------------------------------------------------------- summary
 def region_summary(df, pasa):
     rows = []
@@ -408,7 +515,7 @@ def fmt_table(df):
 
 
 # ---------------------------------------------------------------- charts
-def make_charts(df, ic, pasa, run):
+def make_charts(df, ic, pasa, run, fp=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -417,15 +524,14 @@ def make_charts(df, ic, pasa, run):
     except ImportError:
         print("matplotlib not installed; skipping charts")
         return []
-    colors = {"NSW1": "#2a6fdb", "QLD1": "#a23b72", "VIC1": "#1b998b", "SA1": "#e07a1f",
-              "TAS1": "#6c757d"}
+    colors = COLORS
     fmt = mdates.DateFormatter("%a %H:%M")
     files = []
 
     # 1. Regional prices (symlog so the price cap and negatives both stay readable)
     fig, ax = plt.subplots(figsize=(12, 5))
     for reg, g in df.groupby("REGIONID"):
-        ax.step(g["DATETIME"], g["RRP"], where="post", label=reg, color=colors.get(reg), lw=1.8)
+        ax.step(g["DATETIME"], g["RRP"], where="pre", label=reg, color=colors.get(reg), lw=1.8)
     ax.set_yscale("symlog", linthresh=100)
     for y in (P_HIGH, P_SPIKE):
         ax.axhline(y, color="grey", ls=":", lw=0.8)
@@ -444,14 +550,10 @@ def make_charts(df, ic, pasa, run):
     fig, axes = plt.subplots(len(regs), 1, figsize=(12, 2.6 * len(regs)), sharex=True)
     for ax, reg in zip(axes, regs):
         g = df[df["REGIONID"] == reg]
-        ax.step(g["DATETIME"], g["RRP"], where="post", color=colors[reg], lw=1.8, label="PD RRP")
+        ax.step(g["DATETIME"], g["RRP"], where="pre", color=colors[reg], lw=1.8, label="PD RRP")
         if "SENS_MAX" in g:
-            ax.step(g["DATETIME"], g["SENS_MAX"], where="post", color=colors[reg], lw=1,
+            ax.step(g["DATETIME"], g["SENS_MAX"], where="pre", color=colors[reg], lw=1,
                     ls="--", alpha=0.6, label="Max across scenarios")
-            ax2 = ax.twinx()
-            ax2.bar(g["DATETIME"], g["SENS_N_GE_1000"], width=0.018, color="grey", alpha=0.3)
-            ax2.set_ylim(0, max(43, g["SENS_N"].max() if "SENS_N" in g else 43))
-            ax2.set_ylabel("# scen ≥$1k", fontsize=8)
         if not pasa.empty and "LORCONDITION" in pasa:
             for _, r in pasa[(pasa["REGIONID"] == reg) & (pasa["LORCONDITION"] > 0)].iterrows():
                 ax.axvspan(r["INTERVAL_DATETIME"] - pd.Timedelta(minutes=30),
@@ -461,12 +563,69 @@ def make_charts(df, ic, pasa, run):
         ax.set_ylabel(reg)
         ax.grid(alpha=0.3)
     axes[0].legend(loc="upper left", fontsize=8)
-    axes[0].set_title("Price risk by region (red shading = PD PASA LOR; bars = scenarios ≥ $1000)")
+    axes[0].set_title("Price risk by region (red shading = PD PASA LOR)")
     axes[-1].xaxis.set_major_formatter(fmt)
     fig.autofmt_xdate()
     files.append(f"{OUTDIR}/chart_region_risk.png")
     fig.savefig(files[-1], dpi=110, bbox_inches="tight")
     plt.close(fig)
+
+    # Focus region deep-dive: price, scenarios, demand/availability, imports (small multiples,
+    # one y-scale per panel)
+    if fp is not None and not fp.empty:
+        g = df[df["REGIONID"] == FOCUS]
+        c = colors.get(FOCUS, "#2a78d6")
+        fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True,
+                                 gridspec_kw={"height_ratios": [3, 1.3, 2, 2]})
+        ax = axes[0]
+        ax.step(g["DATETIME"], g["RRP"], where="pre", color=c, lw=2, label="PD RRP")
+        if "SENS_MAX" in g:
+            ax.step(g["DATETIME"], g["SENS_MAX"], where="pre", color=c, lw=1, ls="--",
+                    alpha=0.6, label="Max across demand scenarios")
+        if not pasa.empty and "LORCONDITION" in pasa:
+            for _, r in pasa[(pasa["REGIONID"] == FOCUS) & (pasa["LORCONDITION"] > 0)].iterrows():
+                for a in axes:
+                    a.axvspan(r["INTERVAL_DATETIME"] - pd.Timedelta(minutes=30),
+                              r["INTERVAL_DATETIME"], color="#d03b3b", alpha=0.10, lw=0)
+        ax.set_yscale("symlog", linthresh=100)
+        ax.set_ylim(-1000, 40000)
+        ax.set_ylabel("$/MWh")
+        ax.legend(loc="upper left", fontsize=8)
+        ax.set_title(f"{FOCUS} deep-dive — PD run {run} (red shading = PD PASA LOR)")
+        if "SENS_N_GE_1000" in g:
+            axes[1].bar(g["DATETIME"] - pd.Timedelta(minutes=15), g["SENS_N_GE_1000"],
+                        width=0.018, color=c, alpha=0.7)
+            axes[1].set_ylim(0, int(g["SENS_N"].max()))
+            axes[1].set_ylabel("scenarios\n≥ $1,000")
+        if "TOTALDEMAND" in g:
+            axes[2].step(g["DATETIME"], g["TOTALDEMAND"], where="pre", color="#0b0b0b",
+                         lw=1.5, label="Demand")
+        if "AVAILABLEGENERATION" in g:
+            axes[2].step(g["DATETIME"], g["AVAILABLEGENERATION"], where="pre", color=c,
+                         lw=1.5, ls="--", label="Available generation")
+        axes[2].set_ylabel("MW")
+        axes[2].legend(loc="upper left", fontsize=8)
+        pal = ["#eb6834", "#1baf7a", "#6250d6", "#e87ba4"]
+        for k, (icid, sign, label) in enumerate(FOCUS_IMPORTS.get(FOCUS, [])):
+            x = ic[ic["INTERCONNECTORID"] == icid].sort_values("DATETIME") if not ic.empty else ic
+            if x.empty or x["MWFLOW"].abs().max() == 0:
+                continue
+            imp = sign * x["MWFLOW"]
+            lim = sign * (x["EXPORTLIMIT"] if sign > 0 else x["IMPORTLIMIT"])
+            axes[3].step(x["DATETIME"], imp, where="pre", color=pal[k % 4], lw=1.8,
+                         label=f"Import from {label}")
+            axes[3].step(x["DATETIME"], lim, where="pre", color=pal[k % 4], lw=1, ls=":",
+                         label=f"{label} import limit")
+        axes[3].axhline(0, color="#c3c2b7", lw=0.8)
+        axes[3].set_ylabel("MW")
+        axes[3].legend(loc="upper left", fontsize=7, ncol=2)
+        for a in axes:
+            a.grid(alpha=0.3)
+        axes[-1].xaxis.set_major_formatter(fmt)
+        fig.autofmt_xdate()
+        files.append(f"{OUTDIR}/chart_{FOCUS.lower()}_focus.png")
+        fig.savefig(files[-1], dpi=110, bbox_inches="tight")
+        plt.close(fig)
 
     # 3. Interconnector flows vs limits
     if not ic.empty:
@@ -477,8 +636,8 @@ def make_charts(df, ic, pasa, run):
         for ax, icid in zip(axes, ids):
             g = ic[ic["INTERCONNECTORID"] == icid].sort_values("DATETIME")
             ax.fill_between(g["DATETIME"], g["IMPORTLIMIT"], g["EXPORTLIMIT"], color="#ccd",
-                            alpha=0.5, step="post", label="limits")
-            ax.step(g["DATETIME"], g["MWFLOW"], where="post", color="k", lw=1.4, label="flow")
+                            alpha=0.5, step="pre", label="limits")
+            ax.step(g["DATETIME"], g["MWFLOW"], where="pre", color="k", lw=1.4, label="flow")
             bnd = g[g["BOUND"]]
             ax.scatter(bnd["DATETIME"], bnd["MWFLOW"], color="red", s=10, zorder=3, label="at limit")
             a, z = IC_DIRECTION.get(icid, ("+", "-"))
@@ -551,7 +710,15 @@ def main():
     con_summ, con_hot = analyse_constraints(pd_tables, price_spike_times)
 
     piv = df.pivot_table(index="DATETIME", columns="REGIONID", values="RRP").round(0)
-    charts = make_charts(df, ic, pasa, run)
+    fp = focus_periods(df, ic, pasa, pd_tables)
+    pinned = con_summ[con_summ["pinned"]] if not con_summ.empty else con_summ
+    con_summ = con_summ[~con_summ["pinned"]].drop(columns="pinned") if not con_summ.empty else con_summ
+    focus_cons = (con_summ[con_summ["constraint"].map(relevant_constraint)]
+                  if not con_summ.empty else con_summ)
+    focus_notices = [n for n in notices
+                     if re.search(rf"\b{FOCUS[:-1]}1?\b|{REGION_NAMES.get(FOCUS, '^$')}",
+                                  f"{n['subject']} {n['reason']}", re.I)]
+    charts = make_charts(df, ic, pasa, run, fp)
 
     def notice_lines(ns):
         if not ns:
@@ -569,15 +736,32 @@ def main():
           "Medium = ≥ $300, LOR1 or spare capacity < 5% · Watch = spike only in demand-sensitivity "
           "scenarios · Low = none of the above.",
           "",
-          "## 1. Regional summary",
+          f"## 1. {FOCUS} focus",
+          focus_headline(fp),
+          "",
+          f"### {FOCUS} period by period",
+          "`scen_>=$1k` = demand-sensitivity scenarios with price ≥ $1,000. `from_X` = import "
+          "from region X in MW (negative = export); ● = at the PD limit in the import direction. "
+          f"`top_constraint` = highest-marginal-value binding constraint touching {FOCUS} "
+          "(region letter match, heuristic) with its marginal value.",
+          "",
+          fmt_table(fp.assign(period_ending=fp["period_ending"].map(hhmm))),
+          "",
+          f"### Binding constraints touching {FOCUS}",
+          fmt_table(focus_cons.head(20)) if not focus_cons.empty else "None.",
+          "",
+          f"### {FOCUS} market notices (last 24 h)",
+          "NOTICES_FOCUS_PLACEHOLDER",
+          "",
+          "## 2. Regional summary (all regions)",
           fmt_table(summary.drop(columns="risk_level")),
           "",
-          "## 2. High-price / spike-risk periods",
+          "## 3. High-price / spike-risk periods",
           "PD price ≥ $300, or ≥ $1,000 in at least one of the demand-sensitivity scenarios.",
           "",
           fmt_table(hot) if not hot.empty else "None.",
           "",
-          "## 3. Price sensitivity",
+          "## 4. Price sensitivity",
           (fmt_table(df.groupby("REGIONID").agg(
               pd_max_rrp=("RRP", "max"), scenario_max_rrp=("SENS_MAX", "max"),
               periods_any_scenario_ge_1000=("SENS_N_GE_1000", lambda x: int((x > 0).sum())),
@@ -589,14 +773,14 @@ def main():
           "_Scenario definitions are not included in the sensitivity file, so scenario numbers "
           "are reported as-is._",
           "",
-          "## 4. Interconnector limits",
+          "## 5. Interconnector limits",
           "A period counts as *at limit* when flow is within 1 MW of the PD export/import limit "
           "(or the interconnector has a non-zero marginal value). `limiting_constraints` is the "
           "constraint AEMO reports as setting that limit (EXPORTGENCONID / IMPORTGENCONID).",
           "",
           fmt_table(ic_summ) if not ic_summ.empty else "No interconnector data.",
           "",
-          "## 5. Binding network constraints",
+          "## 6. Binding network constraints",
           "Constraint type / area / network state are decoded heuristically from AEMO's "
           "constraint naming convention.",
           "",
@@ -606,25 +790,30 @@ def main():
           "### Top binding constraints across the horizon",
           fmt_table(con_summ.head(25)) if not con_summ.empty else "No binding constraints reported.",
           "",
-          "## 6. PD PASA lack-of-reserve forecast",
+          f"Excluded from the rankings (marginal value ≥ ${MV_PINNED:,}, typically constraints that "
+          "pin a flow or unit to a fixed value): " +
+          (", ".join(f"`{r.constraint}` ({r.windows})" for r in pinned.itertuples())
+           if not pinned.empty else "none."),
+          "",
+          "## 7. PD PASA lack-of-reserve forecast",
           fmt_table(pasa[pasa["LORCONDITION"] > 0]) if (not pasa.empty and "LORCONDITION" in pasa
                                                         and (pasa["LORCONDITION"] > 0).any())
           else "No LOR forecast by PD PASA.",
           "",
-          "## 7. Market notices (last 24 h)",
+          "## 8. Market notices (last 24 h)",
           "### Network / interconnector / constraint related",
           notice_lines(net_notices),
           "",
           "### Other",
           notice_lines(other_notices),
           "",
-          "## 8. Regional price matrix ($/MWh)",
+          "## 9. Regional price matrix ($/MWh)",
           fmt_table(piv.reset_index()),
           "",
           "Charts: " + (", ".join(os.path.basename(c) for c in charts) or "none") +
           " (in the `pd-risk-report` workflow artifact).",
           ]
-    text = "\n".join(md)
+    text = "\n".join(md).replace("NOTICES_FOCUS_PLACEHOLDER", notice_lines(focus_notices))
     with open(f"{OUTDIR}/pd_risk_{run}.md", "w") as f:
         f.write(text)
     df.to_csv(f"{OUTDIR}/pd_detail_{run}.csv", index=False)
@@ -637,6 +826,11 @@ def main():
     data = {
         "run": run, "generated": f"{now:%Y-%m-%d %H:%M}",
         "summary": json.loads(summary.to_json(orient="records")),
+        "focus": FOCUS,
+        "focus_periods": json.loads(fp.assign(period_ending=fp["period_ending"].dt.strftime(
+            "%Y-%m-%d %H:%M")).to_json(orient="records")),
+        "focus_constraints": json.loads(focus_cons.head(20).to_json(orient="records"))
+        if not focus_cons.empty else [],
         "regions": {reg: {
             "t": t(g["DATETIME"]), "rrp": g["RRP"].round(1).tolist(),
             "sens_max": g["SENS_MAX"].round(1).tolist() if has_sens else [],
