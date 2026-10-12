@@ -411,7 +411,8 @@ def focus_periods(df, ic, pasa, tables, reg=FOCUS):
             imp = (sign * x["MWFLOW"]).reindex(out["period_ending"]).round(0)
             # "at limit" in the import direction for this region
             at = (x["AT_EXPORT"] if sign > 0 else x["AT_IMPORT"]).reindex(out["period_ending"])
-            out[f"from_{label.split()[0]}"] = [
+            key = label.replace(" (", "-").replace(")", "")  # "QLD (Terranora)" -> "QLD-Terranora"
+            out[f"from_{key}"] = [
                 "" if pd.isna(v) else f"{v:.0f}{' ●' if (not pd.isna(a) and bool(a)) else ''}"
                 for v, a in zip(imp.values, at.values)]
     con = no_intervention(pick(tables, "CONSTRAINT_SOLUTION"))
